@@ -1,0 +1,6 @@
+{
+  "name": "KaamHisab – Daily Work & Payment Tracker",
+  "description": "Daily wage, work hours, overtime, and payment tracker for workers with voice input in Hindi, Marathi, and English.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
