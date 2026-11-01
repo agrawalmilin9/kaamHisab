@@ -2,32 +2,64 @@ import express from 'express';
 import dotenv from 'dotenv';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { GoogleGenAI, Type, ThinkingLevel } from '@google/genai';
+import { SarvamAIClient, SarvamAIError } from 'sarvamai';
 
 dotenv.config();
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-
 const app = express();
 
 app.use(express.json());
 
-// Initialize Gemini client on the server side
-let ai: GoogleGenAI | null = null;
-const apiKey = process.env.GEMINI_API_KEY;
-if (apiKey && apiKey !== 'MY_GEMINI_API_KEY' && apiKey.length > 5) {
-  ai = new GoogleGenAI({
-    apiKey: apiKey,
-    httpOptions: {
-      headers: {
-        'User-Agent': 'aistudio-build',
-      },
-    },
-  });
+const sarvamApiKey = process.env.SARVAM_API_KEY;
+const sarvam = sarvamApiKey
+  ? new SarvamAIClient({ apiSubscriptionKey: sarvamApiKey })
+  : null;
+
+type ExtractedWork = {
+  date: string;
+  hoursWorked: number;
+  dailyWage: number;
+  overtimeHours: number;
+  overtimeRate: number;
+  thekedarOrSite: string;
+  workType: string;
+  notes: string;
+};
+
+function normalizeExtractedWork(value: unknown, todayStr: string, defaultWage: number, defaultHours: number): ExtractedWork | null {
+  if (!value || typeof value !== 'object') return null;
+
+  const data = value as Record<string, unknown>;
+  const date = typeof data.date === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(data.date)
+    ? data.date
+    : todayStr;
+  const hoursWorked = Number(data.hoursWorked);
+  const dailyWage = Number(data.dailyWage);
+  const overtimeHours = Number(data.overtimeHours);
+  const overtimeRate = Number(data.overtimeRate ?? 0);
+
+  if (![hoursWorked, dailyWage, overtimeHours, overtimeRate].every(Number.isFinite)) return null;
+  if (hoursWorked < 0 || dailyWage < 0 || overtimeHours < 0 || overtimeRate < 0) return null;
+
+  return {
+    date,
+    hoursWorked: hoursWorked || defaultHours,
+    dailyWage: dailyWage || defaultWage,
+    overtimeHours,
+    overtimeRate,
+    thekedarOrSite: typeof data.thekedarOrSite === 'string' ? data.thekedarOrSite : '',
+    workType: typeof data.workType === 'string' ? data.workType : '',
+    notes: typeof data.notes === 'string' ? data.notes : '',
+  };
 }
 
-// Extraction API endpoint for Indian daily wage voice/text entries
+function parseModelJson(content: string): unknown {
+  const cleaned = content.trim().replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '');
+  return JSON.parse(cleaned);
+}
+
 app.post('/api/extract-work', async (req, res) => {
   const { sentence, defaultWage = 600, defaultHours = 8, referenceDate } = req.body;
 
@@ -37,170 +69,85 @@ app.post('/api/extract-work', async (req, res) => {
 
   const todayStr = referenceDate || new Date().toISOString().split('T')[0];
 
-  // If Gemini API is configured, try server-side extraction with fast thinking
-  if (ai) {
+  if (sarvam) {
     try {
-      const prompt = `You are an expert assistant for Indian daily-wage workers (दिहाड़ी मजदूर, कारीगर, बढ़ई, पेंटर, प्लंबर, हेल्पर) in the KaamHisab app.
-Analyze this work entry sentence spoken or typed by the worker in Hindi, Marathi, Hinglish, or English:
-"${sentence}"
-
-Reference "today" date is: ${todayStr}.
-Worker default daily wage: ₹${defaultWage}.
-Worker default standard shift hours: ${defaultHours} hours.
-
-Extract the following details carefully:
-1. date: YYYY-MM-DD. Handle relative references ("आज" -> ${todayStr}, "कल" -> 1 day before ${todayStr}, "परसों" -> 2 days before ${todayStr}).
-2. hoursWorked: total hours worked (number). If "पूरा दिन" -> ${defaultHours}. If "आधा दिन" -> 4.
-3. dailyWage: wage rate in Rupees (₹). Default: ${defaultWage}.
-4. overtimeHours: additional hours beyond standard shift or explicitly mentioned overtime (number).
-5. overtimeRate: hourly overtime rate if mentioned or 0.
-6. thekedarOrSite: name of contractor or site if mentioned, else empty string.
-7. workType: trade or work type if mentioned, else empty string.
-8. notes: short summary in the user's language.`;
-
-      const geminiCall = ai.models.generateContent({
-        model: 'gemini-3.8-flash',
-        contents: prompt,
-        config: {
-          thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
-          responseMimeType: 'application/json',
-          responseSchema: {
-            type: Type.OBJECT,
-            properties: {
-              date: { type: Type.STRING, description: 'YYYY-MM-DD date' },
-              hoursWorked: { type: Type.NUMBER, description: 'Total hours worked' },
-              dailyWage: { type: Type.NUMBER, description: 'Daily wage rate in ₹' },
-              overtimeHours: { type: Type.NUMBER, description: 'Overtime hours' },
-              overtimeRate: { type: Type.NUMBER, description: 'Overtime rate per hour in ₹' },
-              thekedarOrSite: { type: Type.STRING, description: 'Contractor or site name' },
-              workType: { type: Type.STRING, description: 'Trade or work type' },
-              notes: { type: Type.STRING, description: 'Summary note' },
-            },
-            required: ['date', 'hoursWorked', 'dailyWage', 'overtimeHours'],
+      const response = await sarvam.chat.completions({
+        model: 'sarvam-105b-conversations',
+        messages: [
+          {
+            role: 'system',
+            content: `You extract Indian daily-wage work entries for KaamHisab. Return only valid JSON with these fields: date (YYYY-MM-DD), hoursWorked (number), dailyWage (number), overtimeHours (number), overtimeRate (number), thekedarOrSite (string), workType (string), notes (string). Use reference date ${todayStr}, default wage ${defaultWage}, and default shift ${defaultHours} hours. Understand Hindi, Marathi, Hinglish, and English. Resolve today, yesterday, कल, काल, परसों, and परवा relative to the reference date.`,
           },
-        },
+          { role: 'user', content: sentence },
+        ],
       });
 
-      // Wrap with 4.5s timeout for snappy mobile experience
-      const timeoutPromise = new Promise<never>((_, reject) =>
-        setTimeout(() => reject(new Error('AI response timed out')), 4500)
-      );
+      const content = response.choices[0]?.message?.content;
+      if (typeof content !== 'string' || content.trim().length === 0) throw new Error('Sarvam returned an empty response');
 
-      const response = await Promise.race([geminiCall, timeoutPromise]);
+      const data = normalizeExtractedWork(parseModelJson(content), todayStr, defaultWage, defaultHours);
+      if (!data) throw new Error('Sarvam returned invalid extraction JSON');
 
-      if (response && response.text) {
-        const parsed = JSON.parse(response.text);
-        return res.json({
-          success: true,
-          source: 'gemini',
-          data: {
-            date: parsed.date || todayStr,
-            hoursWorked: Number(parsed.hoursWorked) || defaultHours,
-            dailyWage: Number(parsed.dailyWage) || defaultWage,
-            overtimeHours: Number(parsed.overtimeHours) || 0,
-            overtimeRate: Number(parsed.overtimeRate) || 0,
-            thekedarOrSite: parsed.thekedarOrSite || '',
-            workType: parsed.workType || '',
-            notes: parsed.notes || '',
-          },
-        });
+      return res.json({ success: true, source: 'sarvam', data });
+    } catch (error) {
+      if (error instanceof SarvamAIError) {
+        console.warn(`Sarvam extraction failed with status ${error.statusCode}; using heuristic fallback.`);
+      } else {
+        console.warn('Sarvam extraction failed; using heuristic fallback.');
       }
-    } catch (err: any) {
-      console.warn('Gemini extraction warning, falling back to heuristic:', err?.message || err);
-      // Fall through to heuristic extractor below
     }
   }
 
-  // Fallback intelligent heuristic extractor for offline / no-key situations
   const heuristicData = parseSentenceHeuristic(sentence, defaultWage, defaultHours, todayStr);
-  return res.json({
-    success: true,
-    source: 'heuristic',
-    data: heuristicData,
-  });
+  return res.json({ success: true, source: 'heuristic', data: heuristicData });
 });
 
-// Heuristic extractor for Indian wage sentences
 function parseSentenceHeuristic(sentence: string, defaultWage: number, defaultHours: number, todayStr: string) {
   const text = sentence.toLowerCase().trim();
-  
-  // Date calculation
-  let targetDate = new Date(todayStr);
-  if (text.includes('\u0915\u093e\u0932')) {
-    targetDate.setDate(targetDate.getDate() - 1);
-  }
-  if (text.includes('कल') || text.includes('yesterday') || text.includes('kal')) {
-    targetDate.setDate(targetDate.getDate() - 1);
-  } else if (text.includes('परसों') || text.includes('parso') || text.includes('day before')) {
-    targetDate.setDate(targetDate.getDate() - 2);
-  }
-  if (text.includes('\u092a\u0930\u0935\u093e')) {
-    targetDate.setDate(targetDate.getDate() - 2);
-  }
-  const dateStr = targetDate.toISOString().split('T')[0];
+  const targetDate = new Date(todayStr);
 
-  // Hours calculation
+  if (text.includes('\u0915\u0932') || text.includes('\u0915\u093e\u0932') || text.includes('yesterday') || text.includes('kal')) {
+    targetDate.setDate(targetDate.getDate() - 1);
+  } else if (text.includes('\u092a\u0930\u0938\u094b\u0902') || text.includes('\u092a\u0930\u0935\u093e') || text.includes('parso') || text.includes('day before')) {
+    targetDate.setDate(targetDate.getDate() - 2);
+  }
+
+  const date = targetDate.toISOString().split('T')[0];
   let hoursWorked = defaultHours;
   let overtimeHours = 0;
 
-  // Check half day
-  if (text.includes('आधा दिन') || text.includes('half day') || text.includes('ardha divas') || text.includes('halfday')) {
+  if (text.includes('\u0906\u0927\u093e \u0926\u093f\u0928') || text.includes('half day') || text.includes('ardha divas')) {
     hoursWorked = Math.round(defaultHours / 2);
   }
 
-  // Hours match (e.g. 8 घंटे, 8 hours, 8 ghante, 10 तास)
-  const hoursMatch = text.match(/(\d+(?:\.\d+)?)\s*(?:घंटे|घंटा|hours?|hrs?|ghante|ghanta|तास)/);
-  if (hoursMatch) {
-    hoursWorked = parseFloat(hoursMatch[1]);
-  }
+  const hoursMatch = text.match(/(\d+(?:\.\d+)?)\s*(?:\u0918\u0902\u091f\u0947|\u0918\u0902\u091f\u093e|hours?|hrs?|ghante|ghanta|\u0924\u093e\u0938)/);
+  if (hoursMatch) hoursWorked = parseFloat(hoursMatch[1]);
 
-  // Overtime match (e.g. 2 घंटे ओवरटाइम, 2 hrs overtime, 2 तास ओव्हरटाइम)
-  const otMatch = text.match(/(\d+(?:\.\d+)?)\s*(?:घंटे|घंटा|hours?|hrs?|ghante|taas|तास)?\s*(?:ओवरटाइम|overtime|ओव्हरटाइम|ot)/) ||
-                 text.match(/(?:ओवरटाइम|overtime|ओव्हरटाइम|ot)\s*(?:के|of)?\s*(\d+(?:\.\d+)?)\s*(?:घंटे|घंटा|hours?|hrs?|ghante|taas|तास)?/);
-  if (otMatch) {
-    overtimeHours = parseFloat(otMatch[1]);
-  } else if (hoursWorked > defaultHours) {
-    overtimeHours = hoursWorked - defaultHours;
-  }
+  const otMatch = text.match(/(\d+(?:\.\d+)?)\s*(?:\u0918\u0902\u091f\u0947|\u0918\u0902\u091f\u093e|hours?|hrs?|ghante|taas|\u0924\u093e\u0938)?\s*(?:overtime|ot|\u0913\u0935\u0930\u091f\u093e\u0907\u092e|\u0913\u0935\u094d\u0939\u0930\u091f\u093e\u0907\u092e)/);
+  if (otMatch) overtimeHours = parseFloat(otMatch[1]);
+  else if (hoursWorked > defaultHours) overtimeHours = hoursWorked - defaultHours;
 
-  // Wage match (e.g. दिहाड़ी 600, wage 600, 600 रुपये, 600 rs, रोज 650)
-  let dailyWage = defaultWage;
-  const wageMatch = text.match(/(?:दिहाड़ी|दिहाडी|wage|roj|रोज|rate|वेतन|दहाड़ी)\s*(?:थी|था|है|is|of|hai)?\s*[:=₹Rsrs\.]*\s*(\d{3,5})/) ||
-                    text.match(/(\d{3,5})\s*(?:रुपये|रूपये|रुपए|rupees|rs|rupya|रुपया|₹)/) ||
-                    text.match(/(?:₹|rs\.?)\s*(\d{3,5})/);
-  if (wageMatch) {
-    dailyWage = parseInt(wageMatch[1], 10);
-  }
-
-  // Contractor / Site match
-  let thekedarOrSite = '';
-  const contractorMatch = text.match(/(?:ठेकेदार|thekedar|site|contractor|मालिक|बाबूजी)\s*([a-zA-Z\u0900-\u097F]+)/);
-  if (contractorMatch) {
-    thekedarOrSite = contractorMatch[1];
-  }
+  const wageMatch = text.match(/(\d{3,5})\s*(?:\u0930\u0941\u092a\u092f\u0947|rupees|rs|rupya|\u0930\u0942\u092a\u092f\u0947|\u092e\u091c\u0941\u0930\u0940)/) || text.match(/(?:wage|rate|roj|\u0930\u094b\u091c|\u0935\u0947\u0924\u0928|\u092e\u091c\u0941\u0930\u0940)\s*[:=]?\s*(\d{3,5})/);
+  const dailyWage = wageMatch ? parseInt(wageMatch[1], 10) : defaultWage;
 
   return {
-    date: dateStr,
+    date,
     hoursWorked,
     dailyWage,
     overtimeHours,
     overtimeRate: 0,
-    thekedarOrSite,
+    thekedarOrSite: '',
     workType: '',
     notes: sentence,
   };
 }
 
-// Development server with Vite middleware OR Production static server
 async function startServer() {
   const isDev = process.env.NODE_ENV !== 'production';
 
   if (isDev) {
     const { createServer: createViteServer } = await import('vite');
-    const vite = await createViteServer({
-      server: { middlewareMode: true },
-      appType: 'spa',
-    });
+    const vite = await createViteServer({ server: { middlewareMode: true }, appType: 'spa' });
     app.use(vite.middlewares);
   } else {
     app.use(express.static(path.resolve(__dirname, 'dist')));
@@ -215,6 +162,6 @@ async function startServer() {
   });
 }
 
-startServer().catch((err) => {
-  console.error('Failed to start server:', err);
+startServer().catch(() => {
+  console.error('Failed to start server.');
 });
